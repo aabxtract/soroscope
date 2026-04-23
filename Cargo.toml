@@ -14,4 +14,5 @@ members = [
     "contracts/governance",
     "contracts/cdp",
     "contracts/batch_transfer",
+    "contracts/private_transfer",
 ]
