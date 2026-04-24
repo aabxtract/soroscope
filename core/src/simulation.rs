@@ -568,14 +568,21 @@ impl SimulationEngine {
         }
     }
 
-    /// Try each healthy provider in priority order until one succeeds or all
-    /// are exhausted.
+    /// Try healthy providers in latency-ordered preference until one succeeds
+    /// or all are exhausted.
+    ///
+    /// Ordering comes from `ProviderRegistry::providers_by_latency`, which
+    /// picks the provider with the lowest EMA RTT once every candidate has
+    /// produced enough samples, and round-robins before that so new
+    /// providers aren't starved during warmup. The fallback loop itself
+    /// still visits every healthy provider — ordering only controls which
+    /// one is attempted first.
     async fn simulate_transaction_with_failover(
         &self,
         registry: &Arc<ProviderRegistry>,
         transaction_xdr: &str,
     ) -> Result<SimulationResult, SimulationError> {
-        let providers = registry.healthy_providers().await;
+        let providers = registry.providers_by_latency().await;
 
         if providers.is_empty() {
             return Err(SimulationError::RpcRequestFailed(
@@ -597,20 +604,42 @@ impl SimulationEngine {
                 .as_deref()
                 .zip(provider.auth_value.as_deref());
 
-            match self
+            let started = std::time::Instant::now();
+            let attempt = self
                 .simulate_transaction_single(
                     &provider.url,
                     auth.map(|(h, _)| h),
                     auth.map(|(_, v)| v),
                     transaction_xdr,
                 )
-                .await
-            {
+                .await;
+            let rtt_us = started.elapsed().as_micros() as u64;
+
+            match attempt {
                 Ok(result) => {
+                    // Record RTT **before** reporting success so a slow
+                    // but eventually-successful provider still contributes
+                    // a sample that pushes its EMA up — otherwise a
+                    // consistently slow provider never leaves the "top
+                    // pick" slot even after its EMA should have decayed.
+                    registry.record_rtt(&provider.url, rtt_us);
                     registry.report_success(&provider.url).await;
                     return Ok(result);
                 }
                 Err(e) => {
+                    // Only record RTT for errors that actually produced a
+                    // response from the provider. Connection-level errors
+                    // (DNS, TCP) and timeouts would poison the EMA with
+                    // values that reflect network or client state rather
+                    // than the provider's own latency.
+                    let record_sample = !matches!(
+                        &e,
+                        SimulationError::NodeTimeout | SimulationError::NetworkError(_)
+                    );
+                    if record_sample {
+                        registry.record_rtt(&provider.url, rtt_us);
+                    }
+
                     let should_retry = match &e {
                         SimulationError::NodeTimeout | SimulationError::NetworkError(_) => true,
                         SimulationError::RpcRequestFailed(msg)
