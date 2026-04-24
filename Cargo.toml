@@ -11,4 +11,7 @@ members = [
     "contracts/factory",
     "contracts/math",
     "contracts/typed_data_auth",
+    "contracts/english_auction",
+    "contracts/dutch_auction",
+    "contracts/auction_factory",
 ]
