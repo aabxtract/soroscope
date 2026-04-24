@@ -10,5 +10,10 @@ members = [
     "contracts/cross_call",
     "contracts/factory",
     "contracts/math",
+]
+exclude = [
+    # Pins soroban-sdk=20 which is incompatible with the rest of the workspace
+    # (soroban-sdk=22). Tracked separately; upgrade the contract to the 22 API
+    # to re-include.
     "contracts/typed_data_auth",
 ]
