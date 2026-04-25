@@ -12,4 +12,5 @@ members = [
     "contracts/math",
     "contracts/typed_data_auth",
     "contracts/soulbound_token",
+    "contracts/governance",
 ]
