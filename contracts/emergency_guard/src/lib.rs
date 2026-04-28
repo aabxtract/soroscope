@@ -1,6 +1,6 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, log, vec, Address, Env, Error, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, log, Address, Env, Error, Vec};
 
 /// Granular pause types using bitmask for efficient storage
 /// Each bit represents a different pausable operation
@@ -53,24 +53,21 @@ pub enum DataKey {
     PauseState,
     /// List of authorized admins: Vec<Address>
     Admins,
-    /// Admin rotation queue: Vec<Address>
-    AdminQueue,
     /// Number of signatures required for multi-sig: u32
     SignatureThreshold,
-    /// Pending admin rotation request: Address
-    PendingAdmin,
 }
 
 /// Error codes
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 #[repr(u32)]
 pub enum GuardError {
+    NotInitialized = 0,
     Unauthorized = 1,
     Paused = 2,
     InsufficientSignatures = 3,
     InvalidThreshold = 4,
     AdminNotFound = 5,
-    QueueFull = 6,
+    AlreadyInitialized = 6,
 }
 
 impl From<GuardError> for Error {
@@ -83,33 +80,30 @@ impl From<GuardError> for Error {
 pub type GuardResult<T> = Result<T, GuardError>;
 
 /// EmergencyGuard trait for standardized pause and admin management
-pub trait EmergencyGuard {
+pub trait EmergencyGuardTrait {
     /// Check if an operation is paused. Returns Err if paused.
-    fn require_not_paused(env: &Env, operation: u32) -> GuardResult<()>;
+    fn check_not_paused(env: &Env, operation: u32) -> GuardResult<()>;
 
     /// Get current pause state
-    fn get_pause_state(env: &Env) -> PauseType;
+    fn get_pause_state(env: &Env) -> u32;
 
-    /// Set pause state for a specific operation (admin only)
-    fn set_pause(env: &Env, operation: u32, paused: bool) -> GuardResult<()>;
+    /// Set pause state for a specific operation (any single admin can do this)
+    fn set_pause_state(env: &Env, operation: u32, paused: bool) -> GuardResult<()>;
 
-    /// Emergency pause all operations (multi-sig required)
-    fn emergency_pause_all(env: &Env) -> GuardResult<()>;
+    /// Emergency pause all operations (requires multi-sig approval)
+    fn emergency_pause_all(env: &Env, approvers: Vec<Address>) -> GuardResult<()>;
 
-    /// Resume all operations (multi-sig required)
-    fn resume_all(env: &Env) -> GuardResult<()>;
+    /// Resume all operations (requires multi-sig approval)
+    fn resume_all(env: &Env, approvers: Vec<Address>) -> GuardResult<()>;
 
     /// Initialize emergency guard with admins and threshold
-    fn initialize(env: &Env, admins: Vec<Address>, threshold: u32) -> GuardResult<()>;
+    fn init_guard(env: &Env, admins: Vec<Address>, threshold: u32) -> GuardResult<()>;
 
     /// Add new admin (multi-sig required)
-    fn add_admin(env: &Env, new_admin: Address) -> GuardResult<()>;
+    fn add_admin(env: &Env, approvers: Vec<Address>, new_admin: Address) -> GuardResult<()>;
 
     /// Remove admin (multi-sig required)
-    fn remove_admin(env: &Env, admin: Address) -> GuardResult<()>;
-
-    /// Rotate admin - old admin transfers authority to new admin (old admin only)
-    fn rotate_admin(env: &Env, new_admin: Address) -> GuardResult<()>;
+    fn remove_admin(env: &Env, approvers: Vec<Address>, admin: Address) -> GuardResult<()>;
 
     /// Get list of current admins
     fn get_admins(env: &Env) -> Vec<Address>;
@@ -121,13 +115,17 @@ pub trait EmergencyGuard {
     fn is_admin(env: &Env, addr: &Address) -> bool;
 }
 
-/// Default implementation of EmergencyGuard
-pub struct DefaultEmergencyGuard;
+#[contract]
+pub struct EmergencyGuard;
 
 #[contractimpl]
-impl DefaultEmergencyGuard {
+impl EmergencyGuard {
     /// Initialize the emergency guard with a list of admins and required threshold
-    pub fn init_guard(env: Env, admins: Vec<Address>, threshold: u32) -> GuardResult<()> {
+    pub fn initialize(env: Env, admins: Vec<Address>, threshold: u32) -> GuardResult<()> {
+        if env.storage().instance().has(&DataKey::Admins) {
+            return Err(GuardError::AlreadyInitialized);
+        }
+
         // Verify threshold is valid
         if threshold == 0 || threshold > admins.len() as u32 {
             return Err(GuardError::InvalidThreshold);
@@ -150,69 +148,49 @@ impl DefaultEmergencyGuard {
     }
 
     /// Check if an operation is paused
-    pub fn check_not_paused(env: Env, operation: u32) -> GuardResult<()> {
+    pub fn is_paused(env: Env, operation: u32) -> bool {
         let pause_state: PauseType = env
             .storage()
             .instance()
             .get(&DataKey::PauseState)
             .unwrap_or(PauseType::new(0));
 
-        if pause_state.is_paused(operation) {
-            Err(GuardError::Paused)
-        } else {
-            Ok(())
-        }
-    }
-
-    /// Get current pause state
-    pub fn get_pause_state(env: Env) -> u32 {
-        env.storage()
-            .instance()
-            .get(&DataKey::PauseState)
-            .unwrap_or(PauseType::new(0))
-            .0
+        pause_state.is_paused(operation)
     }
 
     /// Set pause state for a specific operation (any single admin can do this)
-    pub fn set_pause_state(env: Env, operation: u32, paused: bool) -> GuardResult<()> {
-        let caller = env.invoker();
+    pub fn set_pause(env: Env, admin: Address, operation: u32, paused: bool) -> GuardResult<()> {
+        admin.require_auth();
 
         // Check if caller is admin
-        if !Self::is_admin_internal(&env, &caller) {
+        if !Self::is_admin_internal(&env, &admin) {
             return Err(GuardError::Unauthorized);
         }
 
-        // Get current pause state
         let mut pause_state: PauseType = env
             .storage()
             .instance()
             .get(&DataKey::PauseState)
             .unwrap_or(PauseType::new(0));
 
-        // Update pause state
         pause_state.set_paused(operation, paused);
-
-        // Store updated state
         env.storage()
             .instance()
             .set(&DataKey::PauseState, &pause_state);
 
-        log!(&env, "Pause state updated: operation={}, paused={}", operation, paused);
-
+        log!(
+            &env,
+            "Pause state updated: op={}, paused={}",
+            operation,
+            paused
+        );
         Ok(())
     }
 
     /// Emergency pause all operations (requires multi-sig approval)
-    pub fn emergency_pause_all(env: Env) -> GuardResult<()> {
-        let caller = env.invoker();
+    pub fn emergency_pause(env: Env, approvers: Vec<Address>) -> GuardResult<()> {
+        Self::check_multi_sig(&env, &approvers)?;
 
-        // Check if caller is admin
-        if !Self::is_admin_internal(&env, &caller) {
-            return Err(GuardError::Unauthorized);
-        }
-
-        // For now, any admin can pause all (in production, check signatures)
-        // In a real implementation, you'd use Soroban's multi-sig capabilities
         let mut pause_state = PauseType::new(0);
         pause_state.pause_all();
 
@@ -220,29 +198,64 @@ impl DefaultEmergencyGuard {
             .instance()
             .set(&DataKey::PauseState, &pause_state);
 
-        log!(&env, "Emergency pause all activated by {}", caller);
-
+        log!(&env, "Emergency pause all activated");
         Ok(())
     }
 
     /// Resume all operations (requires multi-sig approval)
-    pub fn resume_all(env: Env) -> GuardResult<()> {
-        let caller = env.invoker();
+    pub fn resume(env: Env, approvers: Vec<Address>) -> GuardResult<()> {
+        Self::check_multi_sig(&env, &approvers)?;
 
-        // Check if caller is admin
-        if !Self::is_admin_internal(&env, &caller) {
-            return Err(GuardError::Unauthorized);
-        }
-
-        // For now, any admin can resume all (in production, check signatures)
         let pause_state = PauseType::new(0);
-
         env.storage()
             .instance()
             .set(&DataKey::PauseState, &pause_state);
 
-        log!(&env, "Resume all activated by {}", caller);
+        log!(&env, "Resume all activated");
+        Ok(())
+    }
 
+    /// Add new admin (multi-sig required)
+    pub fn add_admin(env: Env, approvers: Vec<Address>, new_admin: Address) -> GuardResult<()> {
+        Self::check_multi_sig(&env, &approvers)?;
+
+        let mut admins = Self::get_admins(env.clone());
+        if !admins.iter().any(|a| a == new_admin) {
+            admins.push_back(new_admin.clone());
+            env.storage().instance().set(&DataKey::Admins, &admins);
+            log!(&env, "Admin added: {}", new_admin);
+        }
+
+        Ok(())
+    }
+
+    /// Remove admin (multi-sig required)
+    pub fn remove_admin(env: Env, approvers: Vec<Address>, admin: Address) -> GuardResult<()> {
+        Self::check_multi_sig(&env, &approvers)?;
+
+        let mut admins = Self::get_admins(env.clone());
+        let threshold = Self::get_threshold(env.clone());
+
+        if admins.len() as u32 <= threshold {
+            return Err(GuardError::InvalidThreshold);
+        }
+
+        let mut new_admins = Vec::new(&env);
+        let mut found = false;
+        for a in admins.iter() {
+            if a != admin {
+                new_admins.push_back(a);
+            } else {
+                found = true;
+            }
+        }
+
+        if !found {
+            return Err(GuardError::AdminNotFound);
+        }
+
+        env.storage().instance().set(&DataKey::Admins, &new_admins);
+        log!(&env, "Admin removed: {}", admin);
         Ok(())
     }
 
@@ -251,7 +264,7 @@ impl DefaultEmergencyGuard {
         env.storage()
             .instance()
             .get(&DataKey::Admins)
-            .unwrap_or_else(|| vec![&env])
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     /// Get required signature threshold
@@ -259,142 +272,53 @@ impl DefaultEmergencyGuard {
         env.storage()
             .instance()
             .get(&DataKey::SignatureThreshold)
-            .unwrap_or(1)
+            .unwrap_or(0)
     }
 
-    /// Check if address is an admin (internal helper)
+    // Internal helpers
+
     fn is_admin_internal(env: &Env, addr: &Address) -> bool {
         let admins: Vec<Address> = env
             .storage()
             .instance()
             .get(&DataKey::Admins)
-            .unwrap_or_else(|| vec![env]);
+            .unwrap_or_else(|| Vec::new(env));
 
-        admins.iter().any(|a| a == addr)
+        admins.iter().any(|a| a == *addr)
     }
 
-    /// Check if address is an admin (public version)
-    pub fn is_admin(env: Env, addr: Address) -> bool {
-        Self::is_admin_internal(&env, &addr)
-    }
+    fn check_multi_sig(env: &Env, approvers: &Vec<Address>) -> GuardResult<()> {
+        let threshold = env
+            .storage()
+            .instance()
+            .get(&DataKey::SignatureThreshold)
+            .ok_or(GuardError::NotInitialized)?;
 
-    /// Add new admin (multi-sig required)
-    pub fn add_admin(env: Env, new_admin: Address) -> GuardResult<()> {
-        let caller = env.invoker();
-
-        // Check if caller is admin
-        if !Self::is_admin_internal(&env, &caller) {
-            return Err(GuardError::Unauthorized);
+        if approvers.len() < threshold {
+            return Err(GuardError::InsufficientSignatures);
         }
 
-        let mut admins = Self::get_admins(&env);
+        let mut valid_approvers = 0;
+        let mut seen = Vec::new(env);
 
-        // Check if already an admin
-        if admins.iter().any(|a| a == &new_admin) {
-            return Ok(());
-        }
+        for addr in approvers.iter() {
+            // Avoid duplicates
+            if seen.iter().any(|a| a == addr) {
+                continue;
+            }
+            seen.push_back(addr.clone());
 
-        admins.push_back(new_admin.clone());
-        env.storage().instance().set(&DataKey::Admins, &admins);
-
-        log!(&env, "Admin added: {}", new_admin);
-
-        Ok(())
-    }
-
-    /// Remove admin (multi-sig required, but prevents removing all admins)
-    pub fn remove_admin(env: Env, admin: Address) -> GuardResult<()> {
-        let caller = env.invoker();
-
-        // Check if caller is admin
-        if !Self::is_admin_internal(&env, &caller) {
-            return Err(GuardError::Unauthorized);
-        }
-
-        let mut admins = Self::get_admins(&env);
-        let threshold = Self::get_threshold(&env);
-
-        // Prevent removing admin if it would violate threshold
-        if (admins.len() as u32) <= threshold {
-            return Err(GuardError::InvalidThreshold);
-        }
-
-        // Find and remove the admin
-        let initial_len = admins.len();
-        let mut new_admins = vec![&env];
-        for a in admins.iter() {
-            if a != &admin {
-                new_admins.push_back(a.clone());
+            // Check if address is an admin
+            if Self::is_admin_internal(env, &addr) {
+                addr.require_auth();
+                valid_approvers += 1;
             }
         }
 
-        if new_admins.len() == initial_len {
-            return Err(GuardError::AdminNotFound);
+        if valid_approvers < threshold {
+            Err(GuardError::InsufficientSignatures)
+        } else {
+            Ok(())
         }
-
-        env.storage().instance().set(&DataKey::Admins, &new_admins);
-
-        log!(&env, "Admin removed: {}", admin);
-
-        Ok(())
-    }
-
-    /// Rotate admin - old admin transfers authority to new admin
-    /// The old admin must sign the transaction
-    pub fn rotate_admin(env: Env, new_admin: Address) -> GuardResult<()> {
-        let caller = env.invoker();
-
-        // Check if caller is admin
-        if !Self::is_admin_internal(&env, &caller) {
-            return Err(GuardError::Unauthorized);
-        }
-
-        let mut admins = Self::get_admins(&env);
-
-        // Find the caller's index and replace with new admin
-        let mut found = false;
-        for i in 0..admins.len() {
-            if &admins.get_unchecked(i) == &caller {
-                admins.set(i, new_admin.clone());
-                found = true;
-                break;
-            }
-        }
-
-        if !found {
-            return Err(GuardError::AdminNotFound);
-        }
-
-        env.storage().instance().set(&DataKey::Admins, &admins);
-
-        log!(&env, "Admin rotated: {} -> {}", caller, new_admin);
-
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use soroban_sdk::testutils::{Address as _, Env as _};
-
-    #[test]
-    fn test_pause_type_operations() {
-        let mut pause = PauseType::new(0);
-        assert!(!pause.is_paused(PauseType::SWAP));
-
-        pause.set_paused(PauseType::SWAP, true);
-        assert!(pause.is_paused(PauseType::SWAP));
-        assert!(!pause.is_paused(PauseType::DEPOSIT));
-
-        pause.set_paused(PauseType::DEPOSIT, true);
-        assert!(pause.is_paused(PauseType::DEPOSIT));
-
-        pause.set_paused(PauseType::SWAP, false);
-        assert!(!pause.is_paused(PauseType::SWAP));
-        assert!(pause.is_paused(PauseType::DEPOSIT));
-
-        pause.unpause_all();
-        assert!(!pause.is_paused(PauseType::DEPOSIT));
     }
 }

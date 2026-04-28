@@ -9,4 +9,5 @@ members = [
     "contracts/cpu_heavy",
     "contracts/cross_call",
     "contracts/factory",
+    "contracts/emergency_guard",
 ]

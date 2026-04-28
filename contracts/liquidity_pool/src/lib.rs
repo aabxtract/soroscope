@@ -1,5 +1,6 @@
 #![no_std]
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, String};
+use emergency_guard::{EmergencyGuard, PauseType};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, String, Vec};
 
 #[cfg(test)]
 mod fuzz_test;
@@ -135,13 +136,8 @@ pub enum DataKey {
     Paused,
 }
 
-fn check_paused(e: &Env) -> Result<(), Error> {
-    let paused: bool = e
-        .storage()
-        .instance()
-        .get(&DataKey::Paused)
-        .unwrap_or(false);
-    if paused {
+fn check_not_paused(e: &Env, operation: u32) -> Result<(), Error> {
+    if EmergencyGuard::is_paused(e.clone(), operation) {
         Err(Error::Paused)
     } else {
         Ok(())
@@ -224,16 +220,14 @@ impl LiquidityPool {
         Ok(())
     }
 
-    /// Admin-only: pause or unpause the pool.
-    pub fn set_paused(e: Env, paused: bool) -> Result<(), Error> {
-        let admin: Address = e
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::NotInitialized)?;
-        admin.require_auth();
-        e.storage().instance().set(&DataKey::Paused, &paused);
-        Ok(())
+    /// Admin-only: pause or unpause the pool for a specific operation.
+    pub fn set_paused(e: Env, admin: Address, operation: u32, paused: bool) -> Result<(), Error> {
+        EmergencyGuard::set_pause(e, admin, operation, paused).map_err(|_| Error::Unauthorized)
+    }
+
+    /// Admin-only: emergency pause all operations.
+    pub fn emergency_pause(e: Env, approvers: Vec<Address>) -> Result<(), Error> {
+        EmergencyGuard::emergency_pause(e, approvers).map_err(|_| Error::Unauthorized)
     }
 
     /// Deposits token A and token B into the pool and mints LP shares.
@@ -253,7 +247,7 @@ impl LiquidityPool {
     /// - `Err(Error::NotInitialized)`: Pool tokens were not configured.
     /// - `Err(Error::InsufficientLiquidity)`: Arithmetic failed (for example overflow).
     pub fn deposit(e: Env, to: Address, amount_a: i128, amount_b: i128) -> Result<i128, Error> {
-        check_paused(&e)?;
+        check_not_paused(&e, PauseType::DEPOSIT)?;
         to.require_auth();
 
         // Transfer tokens to the contract
@@ -362,7 +356,7 @@ impl LiquidityPool {
     /// - `Err(Error::InsufficientLiquidity)`: Requested `out` exceeds available reserve.
     /// - `Err(Error::SlippageExceeded)`: Required input is greater than `in_max`.
     pub fn swap(e: Env, to: Address, buy_a: bool, out: i128, in_max: i128) -> Result<i128, Error> {
-        check_paused(&e)?;
+        check_not_paused(&e, PauseType::SWAP)?;
         to.require_auth();
 
         let token_a: Address = e
@@ -468,7 +462,7 @@ impl LiquidityPool {
     /// - `Err(Error::InsufficientShares)`: User does not own enough LP shares.
     /// - `Err(Error::NotInitialized)`: Pool state is incomplete or not initialized.
     pub fn withdraw(e: Env, to: Address, share_amount: i128) -> Result<(i128, i128), Error> {
-        check_paused(&e)?;
+        check_not_paused(&e, PauseType::WITHDRAW)?;
         to.require_auth();
 
         let user_share_key = DataKey::Balance(to.clone());
@@ -552,7 +546,7 @@ impl LiquidityPool {
     /// - `Err(Error::InsufficientShares)`: User does not own enough LP shares.
     /// - `Err(Error::NotInitialized)`: Pool state is incomplete or not initialized.
     pub fn burn(e: Env, from: Address, amount: i128) -> Result<(), Error> {
-        check_paused(&e)?;
+        check_not_paused(&e, PauseType::BURN)?;
         from.require_auth();
 
         let user_share_key = DataKey::Balance(from.clone());

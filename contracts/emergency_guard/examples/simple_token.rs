@@ -1,8 +1,8 @@
 // Example contract showing how to use EmergencyGuard
 // This demonstrates a simple token contract with pause functionality
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Vec, vec, String};
-use emergency_guard::{DefaultEmergencyGuard, PauseType, GuardError};
+use emergency_guard::{DefaultEmergencyGuard, GuardError, PauseType};
+use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, Env, String, Vec};
 
 #[contracttype]
 pub enum DataKey {
@@ -24,7 +24,7 @@ pub struct SimpleToken;
 #[contractimpl]
 impl SimpleToken {
     /// Initialize the token with admin and emergency guard
-    /// 
+    ///
     /// # Arguments
     /// * `env` - Soroban environment
     /// * `admin` - Address of the token admin
@@ -36,7 +36,9 @@ impl SimpleToken {
         env.storage().instance().set(&DataKey::Admin, &admin);
 
         // Store initial supply
-        env.storage().instance().set(&DataKey::TotalSupply, &initial_supply);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalSupply, &initial_supply);
 
         // Mint initial supply to admin
         env.storage()
@@ -65,10 +67,9 @@ impl SimpleToken {
 
         assert!(balance >= amount, "Insufficient balance");
 
-        env.storage().instance().set(
-            &DataKey::Balance(from.clone()),
-            &(balance - amount),
-        );
+        env.storage()
+            .instance()
+            .set(&DataKey::Balance(from.clone()), &(balance - amount));
 
         let to_balance: i128 = env
             .storage()
@@ -84,8 +85,7 @@ impl SimpleToken {
     /// Mint tokens (blocked if MINT pause is active)
     pub fn mint(env: Env, to: Address, amount: i128) {
         // Check if minting is paused
-        DefaultEmergencyGuard::check_not_paused(&env, PauseType::MINT)
-            .expect("Minting is paused");
+        DefaultEmergencyGuard::check_not_paused(&env, PauseType::MINT).expect("Minting is paused");
 
         let admin: Address = env
             .storage()
@@ -119,8 +119,7 @@ impl SimpleToken {
     /// Burn tokens (blocked if BURN pause is active)
     pub fn burn(env: Env, from: Address, amount: i128) {
         // Check if burning is paused
-        DefaultEmergencyGuard::check_not_paused(&env, PauseType::BURN)
-            .expect("Burning is paused");
+        DefaultEmergencyGuard::check_not_paused(&env, PauseType::BURN).expect("Burning is paused");
 
         from.require_auth();
 
@@ -163,38 +162,32 @@ impl SimpleToken {
 
     /// Pause only minting
     pub fn pause_minting(env: Env) {
-        DefaultEmergencyGuard::set_pause_state(&env, PauseType::MINT, true)
-            .expect("Unauthorized");
+        DefaultEmergencyGuard::set_pause_state(&env, PauseType::MINT, true).expect("Unauthorized");
     }
 
     /// Resume minting
     pub fn resume_minting(env: Env) {
-        DefaultEmergencyGuard::set_pause_state(&env, PauseType::MINT, false)
-            .expect("Unauthorized");
+        DefaultEmergencyGuard::set_pause_state(&env, PauseType::MINT, false).expect("Unauthorized");
     }
 
     /// Pause only burning
     pub fn pause_burning(env: Env) {
-        DefaultEmergencyGuard::set_pause_state(&env, PauseType::BURN, true)
-            .expect("Unauthorized");
+        DefaultEmergencyGuard::set_pause_state(&env, PauseType::BURN, true).expect("Unauthorized");
     }
 
     /// Resume burning
     pub fn resume_burning(env: Env) {
-        DefaultEmergencyGuard::set_pause_state(&env, PauseType::BURN, false)
-            .expect("Unauthorized");
+        DefaultEmergencyGuard::set_pause_state(&env, PauseType::BURN, false).expect("Unauthorized");
     }
 
     /// Emergency: pause all operations
     pub fn emergency_pause_all(env: Env) {
-        DefaultEmergencyGuard::emergency_pause_all(&env)
-            .expect("Unauthorized");
+        DefaultEmergencyGuard::emergency_pause_all(&env).expect("Unauthorized");
     }
 
     /// Resume all operations
     pub fn resume_all(env: Env) {
-        DefaultEmergencyGuard::resume_all(&env)
-            .expect("Unauthorized");
+        DefaultEmergencyGuard::resume_all(&env).expect("Unauthorized");
     }
 
     /// Get current pause state (bitmask)
@@ -233,8 +226,7 @@ impl SimpleToken {
 
     /// Rotate admin (current admin transfers authority to new admin)
     pub fn rotate_admin(env: Env, new_admin: Address) {
-        DefaultEmergencyGuard::rotate_admin(&env, new_admin)
-            .expect("Unauthorized");
+        DefaultEmergencyGuard::rotate_admin(&env, new_admin).expect("Unauthorized");
     }
 
     // ==== READ-ONLY FUNCTIONS ====

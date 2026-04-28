@@ -1465,5 +1465,23 @@ mod tests {
             assert_eq!(cache.get(&k1).await.unwrap().latest_ledger, 1);
             assert_eq!(cache.get(&k2).await.unwrap().latest_ledger, 2);
         }
+
+        #[test]
+        fn test_auth_signer_serialization() {
+            #[derive(Serialize, Deserialize, Debug, PartialEq)]
+            struct AuthSigner {
+                address: String,
+                weight: u32,
+            }
+
+            let signer = AuthSigner {
+                address: "GDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC".to_string(),
+                weight: 1,
+            };
+
+            let json = serde_json::to_string(&signer).unwrap();
+            let deserialized: AuthSigner = serde_json::from_str(&json).unwrap();
+            assert_eq!(signer, deserialized);
+        }
     }
 }
