@@ -8,6 +8,7 @@ pub mod fee_store;
 pub mod insights;
 mod jobs;
 mod parser;
+mod routing;
 pub mod rpc_provider;
 mod simulation;
 mod ws;
