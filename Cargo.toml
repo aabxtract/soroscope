@@ -10,6 +10,5 @@ members = [
     "contracts/cpu_heavy",
     "contracts/cross_call",
     "contracts/factory",
-    "contracts/math",
-    # "contracts/typed_data_auth",  # temporarily excluded: soroban-sdk v20 conflicts with v22
+    "contracts/emergency_guard",
 ]

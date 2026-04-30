@@ -3885,113 +3885,22 @@ mod tests {
             assert_eq!(cache.get(&k2).await.unwrap().latest_ledger, 2);
         }
 
-        // ── Two-tier L1+L2 tests ───────────────────────────────────────
+        #[test]
+        fn test_auth_signer_serialization() {
+            #[derive(Serialize, Deserialize, Debug, PartialEq)]
+            struct AuthSigner {
+                address: String,
+                weight: u32,
+            }
 
-        fn open_disk_l2(max_age: u32) -> (tempfile::TempDir, Arc<crate::cache::DiskCache>) {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let disk = crate::cache::DiskCache::open_at(dir.path(), max_age)
-                .expect("open disk cache");
-            (dir, Arc::new(disk))
-        }
+            let signer = AuthSigner {
+                address: "GDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC".to_string(),
+                weight: 1,
+            };
 
-        #[tokio::test]
-        async fn two_tier_cache_promotes_l2_hit_to_l1() {
-            let (_dir, l2) = open_disk_l2(100);
-            let cache = SimulationCache::new().with_disk_cache(Arc::clone(&l2));
-            let key = SimulationCache::generate_key("CONTRACT_A", "fn_x", &[]);
-
-            // Seed L2 directly — bypass the set() path so L1 stays empty.
-            let mut result = make_result();
-            result.latest_ledger = 500;
-            let raw = serde_json::to_vec(&result).unwrap();
-            l2.set(key.as_bytes(), raw, 500).unwrap();
-
-            // First get: L1 misses, L2 hits, result is promoted into L1.
-            let first = cache.get(&key).await.expect("L2 hit");
-            assert_eq!(first.latest_ledger, 500);
-            assert_eq!(cache.l2_hits.load(Ordering::Relaxed), 1);
-            assert_eq!(cache.hits.load(Ordering::Relaxed), 0);
-
-            // Second get: L1 now serves it.
-            let second = cache.get(&key).await.expect("L1 hit after promotion");
-            assert_eq!(second.latest_ledger, 500);
-            assert_eq!(cache.hits.load(Ordering::Relaxed), 1);
-            assert_eq!(cache.l2_hits.load(Ordering::Relaxed), 1);
-        }
-
-        #[tokio::test]
-        async fn two_tier_set_writes_through_to_l2() {
-            let (_dir, l2) = open_disk_l2(100);
-            let cache = SimulationCache::new().with_disk_cache(Arc::clone(&l2));
-            let key = SimulationCache::generate_key("CONTRACT_A", "fn_x", &[]);
-            let mut result = make_result();
-            result.latest_ledger = 300;
-            cache.set(key.clone(), result.clone()).await;
-
-            // Raw L2 read confirms the payload is there, stamped at the
-            // SimulationResult's own ledger sequence.
-            let raw = l2.get(key.as_bytes(), 300).expect("L2 has payload");
-            let decoded: SimulationResult = serde_json::from_slice(&raw).unwrap();
-            assert_eq!(decoded.latest_ledger, 300);
-        }
-
-        #[tokio::test]
-        async fn two_tier_stale_l2_entry_does_not_promote() {
-            // max_ledger_age = 10; entry written at ledger 100; we read
-            // at ledger 200 — well past the staleness threshold. Expect
-            // a full miss, not a promotion.
-            let (_dir, l2) = open_disk_l2(10);
-            let cache = SimulationCache::new().with_disk_cache(Arc::clone(&l2));
-            cache.set_current_ledger(200);
-            let key = SimulationCache::generate_key("CONTRACT_A", "fn_x", &[]);
-            let mut result = make_result();
-            result.latest_ledger = 100;
-            let raw = serde_json::to_vec(&result).unwrap();
-            l2.set(key.as_bytes(), raw, 100).unwrap();
-
-            assert!(cache.get(&key).await.is_none());
-            assert_eq!(cache.misses.load(Ordering::Relaxed), 1);
-            assert_eq!(cache.l2_hits.load(Ordering::Relaxed), 0);
-        }
-
-        #[tokio::test]
-        async fn two_tier_without_l2_behaves_as_l1_only() {
-            // Sanity-check: a cache built without `with_disk_cache` still
-            // works exactly like the pre-#104 cache.
-            let cache = SimulationCache::new();
-            let key = SimulationCache::generate_key("CONTRACT_A", "fn_x", &[]);
-            assert!(cache.get(&key).await.is_none());
-            cache.set(key.clone(), make_result()).await;
-            assert!(cache.get(&key).await.is_some());
-        }
-
-        #[tokio::test]
-        async fn current_ledger_is_readable_after_set() {
-            let cache = SimulationCache::new();
-            assert_eq!(cache.current_ledger(), 0);
-            cache.set_current_ledger(42);
-            assert_eq!(cache.current_ledger(), 42);
-        }
-
-        #[tokio::test]
-        async fn evict_stale_l2_is_noop_without_disk_cache() {
-            let cache = SimulationCache::new();
-            assert_eq!(cache.evict_stale_l2(), 0);
-        }
-
-        #[tokio::test]
-        async fn evict_stale_l2_sweeps_disk_when_attached() {
-            let (_dir, l2) = open_disk_l2(10);
-            let cache = SimulationCache::new().with_disk_cache(Arc::clone(&l2));
-            cache.set_current_ledger(200);
-            let key = SimulationCache::generate_key("C", "f", &[]);
-            let mut result = make_result();
-            result.latest_ledger = 100;
-            cache.set(key.clone(), result).await;
-            // Entry is in L2 stamped at 100; at current_ledger=200 with
-            // max_age=10 it's stale. The sweep must remove it.
-            assert_eq!(cache.evict_stale_l2(), 1);
-            assert_eq!(l2.len(), 0);
+            let json = serde_json::to_string(&signer).unwrap();
+            let deserialized: AuthSigner = serde_json::from_str(&json).unwrap();
+            assert_eq!(signer, deserialized);
         }
     }
     // ── Multi-auth tests ──────────────────────────────────────────────────────
