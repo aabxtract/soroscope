@@ -40,7 +40,8 @@ ed25519-dalek = "1"
 sha2 = "0.10"
 rand = "0.8"
 moka = { version = "0.12", features = ["future"] }
-sqlx = { version = "0.7", features = ["runtime-tokio", "tls-rustls", "postgres", "sqlite", "uuid", "chrono", "migrate"] }
+sled = "0.34"
+sqlx = { version = "0.7", features = ["runtime-tokio", "tls-native-tls", "postgres", "sqlite", "uuid", "chrono", "migrate"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 wasmparser = "0.244.0"

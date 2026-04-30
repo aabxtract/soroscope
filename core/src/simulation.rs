@@ -1,8 +1,7 @@
 use crate::parser::ArgParser;
 use crate::rpc_provider::ProviderRegistry;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use ed25519_dalek::Signer as Ed25519Signer;
-use moka::future::Cache;
+// use moka::future::Cache;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -16,8 +15,7 @@ use soroban_sdk::xdr::{
     WriteXdr,
 };
 use std::collections::HashMap;
-use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
+// use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use stellar_strkey::Strkey;
@@ -1005,10 +1003,7 @@ pub struct SimulationEngine {
     request_timeout: std::time::Duration,
     /// When set, the engine will iterate healthy providers and failover automatically.
     registry: Option<Arc<ProviderRegistry>>,
-    /// Optional local WASM runner. When attached, the engine tries in-process
-    /// execution first and falls back to RPC on `LocalUnavailable` or other
-    /// retriable errors.
-    local_runner: Option<Arc<crate::runner::LocalRunner>>,
+    contract_cache: Option<Arc<crate::cache::ContractCache>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1030,7 +1025,7 @@ impl SimulationEngine {
             client: Client::new(),
             request_timeout: std::time::Duration::from_secs(30),
             registry: None,
-            local_runner: None,
+            contract_cache: None,
         }
     }
 
@@ -1046,7 +1041,21 @@ impl SimulationEngine {
             client: Client::new(),
             request_timeout: std::time::Duration::from_secs(30),
             registry: Some(registry),
-            local_runner: None,
+            contract_cache: None,
+        }
+    }
+
+    /// Create an engine with a registry and a contract cache.
+    pub fn with_registry_and_cache(
+        registry: Arc<ProviderRegistry>,
+        cache: Arc<crate::cache::ContractCache>,
+    ) -> Self {
+        Self {
+            rpc_url: String::new(),
+            client: Client::new(),
+            request_timeout: std::time::Duration::from_secs(30),
+            registry: Some(registry),
+            contract_cache: Some(cache),
         }
     }
 
@@ -1069,7 +1078,7 @@ impl SimulationEngine {
             client: Client::new(),
             request_timeout: timeout,
             registry: Some(registry),
-            local_runner: None,
+            contract_cache: None,
         }
     }
 
@@ -1097,6 +1106,112 @@ impl SimulationEngine {
     /// Get the current request timeout.
     pub fn timeout(&self) -> std::time::Duration {
         self.request_timeout
+    }
+
+    /// Get the WASM bytes for a contract, checking the cache first.
+    pub async fn get_contract_wasm(&self, contract_id: &str) -> Result<Vec<u8>, SimulationError> {
+        let contract_hash_bytes = self.parse_contract_id(contract_id)?;
+        let hash_hex = hex::encode(contract_hash_bytes);
+
+        if let Some(cache) = &self.contract_cache {
+            if let Some(wasm) = cache.get_wasm(&hash_hex) {
+                tracing::debug!(contract_id = %contract_id, "WASM cache HIT");
+                return Ok(wasm);
+            }
+        }
+
+        tracing::info!(contract_id = %contract_id, "WASM cache MISS, fetching from RPC");
+        
+        // 1. Fetch contract instance to get the WASM hash
+        let instance_key = LedgerKey::ContractData(soroban_sdk::xdr::ContractDataLedgerKey {
+            contract: ScAddress::Contract(Hash(contract_hash_bytes)),
+            key: ScVal::LedgerKeyContractInstance,
+            durability: soroban_sdk::xdr::ContractDataDurability::Persistent,
+        });
+
+        let key_xdr = BASE64.encode(instance_key.to_xdr(Limits::none()).map_err(|e| SimulationError::XdrError(e.to_string()))?);
+        
+        // We need a provider URL to fetch from.
+        let (url, auth_h, auth_v) = match &self.registry {
+            Some(reg) => {
+                let p = reg.healthy_providers().await.into_iter().next().ok_or_else(|| SimulationError::RpcRequestFailed("No healthy providers".to_string()))?;
+                (p.url.clone(), p.auth_header.clone(), p.auth_value.clone())
+            }
+            None => (self.rpc_url.clone(), None, None),
+        };
+
+        let req = GetLedgerEntriesRequest {
+            jsonrpc: "2.0".to_string(),
+            id: 1,
+            method: "getLedgerEntries".to_string(),
+            params: GetLedgerEntriesParams {
+                keys: vec![key_xdr],
+            },
+        };
+
+        let response: GetLedgerEntriesResponse = self.client.post(&url).json(&req).send().await?.json().await.map_err(|e| SimulationError::RpcRequestFailed(e.to_string()))?;
+        let entries = match response.result {
+            LedgerEntriesResponseResult::Success { result } => result.entries,
+            LedgerEntriesResponseResult::Error { error } => return Err(SimulationError::NodeError(error.message)),
+        };
+
+        let entry_meta = entries.first().ok_or_else(|| SimulationError::InvalidContract("Contract instance not found".to_string()))?;
+        let entry_xdr = entry_meta.xdr.as_ref().ok_or_else(|| SimulationError::InvalidContract("No XDR in ledger entry".to_string()))?;
+        let entry_bytes = BASE64.decode(entry_xdr)?;
+        let entry = LedgerEntry::from_xdr(&entry_bytes, Limits::none()).map_err(|e| SimulationError::XdrError(e.to_string()))?;
+
+        let wasm_hash = match entry.data {
+            soroban_sdk::xdr::LedgerEntryData::ContractData(d) => {
+                match d.val {
+                    ScVal::ContractInstance(i) => {
+                        match i.executable {
+                            soroban_sdk::xdr::ContractExecutable::Wasm(h) => h,
+                            _ => return Err(SimulationError::InvalidContract("Contract is not a WASM contract".to_string())),
+                        }
+                    }
+                    _ => return Err(SimulationError::InvalidContract("Invalid contract instance data".to_string())),
+                }
+            }
+            _ => return Err(SimulationError::InvalidContract("Invalid ledger entry data type".to_string())),
+        };
+
+        // 2. Fetch the actual WASM bytes
+        let wasm_key = LedgerKey::ContractCode(soroban_sdk::xdr::ContractCodeLedgerKey {
+            hash: wasm_hash.clone(),
+        });
+        let wasm_key_xdr = BASE64.encode(wasm_key.to_xdr(Limits::none()).map_err(|e| SimulationError::XdrError(e.to_string()))?);
+
+        let req2 = GetLedgerEntriesRequest {
+            jsonrpc: "2.0".to_string(),
+            id: 2,
+            method: "getLedgerEntries".to_string(),
+            params: GetLedgerEntriesParams {
+                keys: vec![wasm_key_xdr],
+            },
+        };
+
+        let response2: GetLedgerEntriesResponse = self.client.post(&url).json(&req2).send().await?.json().await.map_err(|e| SimulationError::RpcRequestFailed(e.to_string()))?;
+        let entries2 = match response2.result {
+            LedgerEntriesResponseResult::Success { result } => result.entries,
+            LedgerEntriesResponseResult::Error { error } => return Err(SimulationError::NodeError(error.message)),
+        };
+
+        let entry_meta2 = entries2.first().ok_or_else(|| SimulationError::InvalidContract("Contract code not found".to_string()))?;
+        let entry_xdr2 = entry_meta2.xdr.as_ref().ok_or_else(|| SimulationError::InvalidContract("No XDR in code ledger entry".to_string()))?;
+        let entry_bytes2 = BASE64.decode(entry_xdr2)?;
+        let entry2 = LedgerEntry::from_xdr(&entry_bytes2, Limits::none()).map_err(|e| SimulationError::XdrError(e.to_string()))?;
+
+        let wasm_bytes = match entry2.data {
+            soroban_sdk::xdr::LedgerEntryData::ContractCode(c) => c.code.to_vec(),
+            _ => return Err(SimulationError::InvalidContract("Invalid code ledger entry data type".to_string())),
+        };
+
+        // 3. Cache and return
+        if let Some(cache) = &self.contract_cache {
+            cache.set_wasm(hash_hex, wasm_bytes.clone());
+        }
+
+        Ok(wasm_bytes)
     }
 
     /// Simulate transaction from a deployed contract ID
@@ -2154,13 +2269,45 @@ impl SimulationEngine {
         auth_value: Option<&str>,
         touched_keys: &[String],
         latest_ledger: u64,
-    ) -> Result<(TtlAnalysisReport, SimulationStateSnapshot), SimulationError> {
+    ) -> Result<TtlAnalysisReport, SimulationError> {
+        let mut missing_keys = Vec::new();
+        let mut cached_reports = Vec::new();
+
+        if let Some(cache) = &self.contract_cache {
+            for key in touched_keys {
+                if let Some(entry_bytes) = cache.get_ledger_entry(key, latest_ledger) {
+                    if let Ok(entry_meta) = serde_json::from_slice::<LedgerEntryWithMeta>(&entry_bytes) {
+                        if let Some(live_until) = entry_meta.live_until_ledger_seq {
+                            cached_reports.push(TtlEntryReport {
+                                key: entry_meta.key,
+                                live_until_ledger: live_until,
+                                remaining_ledgers: live_until as i64 - latest_ledger as i64,
+                            });
+                            continue;
+                        }
+                    }
+                }
+                missing_keys.push(key.clone());
+            }
+        } else {
+            missing_keys = touched_keys.to_vec();
+        }
+
+        if missing_keys.is_empty() {
+            let extend_ttl_suggestions = Self::build_extend_ttl_suggestions(&cached_reports, latest_ledger);
+            return Ok(TtlAnalysisReport {
+                current_ledger: latest_ledger,
+                touched_entries: cached_reports,
+                extend_ttl_suggestions,
+            });
+        }
+
         let req = GetLedgerEntriesRequest {
             jsonrpc: "2.0".to_string(),
             id: 1,
             method: "getLedgerEntries".to_string(),
             params: GetLedgerEntriesParams {
-                keys: touched_keys.to_vec(),
+                keys: missing_keys.clone(),
             },
         };
 
@@ -2185,7 +2332,7 @@ impl SimulationEngine {
             SimulationError::RpcRequestFailed(format!("Failed to parse response: {}", e))
         })?;
 
-        let entries = match rpc_response.result {
+        let fetched_entries = match rpc_response.result {
             LedgerEntriesResponseResult::Success { result } => result.entries,
             LedgerEntriesResponseResult::Error { error } => {
                 return Err(SimulationError::RpcRequestFailed(format!(
@@ -2195,43 +2342,31 @@ impl SimulationEngine {
             }
         };
 
-        let mut ledger_entries = HashMap::new();
-        let mut ttl_entries = HashMap::new();
-
-        let touched_entries: Vec<TtlEntryReport> = entries
-            .into_iter()
-            .filter_map(|entry| {
-                if let Some(xdr) = &entry.xdr {
-                    ledger_entries.insert(entry.key.clone(), xdr.clone());
+        let mut all_reports = cached_reports;
+        for entry in fetched_entries {
+            if let Some(cache) = &self.contract_cache {
+                if let Ok(bytes) = serde_json::to_vec(&entry) {
+                    cache.set_ledger_entry(entry.key.clone(), bytes, latest_ledger);
                 }
-                
-                let live_until = entry.live_until_ledger_seq?;
-                ttl_entries.insert(entry.key.clone(), live_until);
-                
-                let remaining = live_until as i64 - latest_ledger as i64;
-                Some(TtlEntryReport {
+            }
+
+            if let Some(live_until) = entry.live_until_ledger_seq {
+                all_reports.push(TtlEntryReport {
                     key: entry.key,
                     live_until_ledger: live_until,
-                    remaining_ledgers: remaining,
-                })
-            })
-            .collect();
+                    remaining_ledgers: live_until as i64 - latest_ledger as i64,
+                });
+            }
+        }
 
         let extend_ttl_suggestions =
-            Self::build_extend_ttl_suggestions(&touched_entries, latest_ledger);
+            Self::build_extend_ttl_suggestions(&all_reports, latest_ledger);
 
-        Ok((
-            TtlAnalysisReport {
-                current_ledger: latest_ledger,
-                touched_entries,
-                extend_ttl_suggestions,
-            },
-            SimulationStateSnapshot {
-                ledger_entries,
-                ttl_entries,
-                latest_ledger,
-            },
-        ))
+        Ok(TtlAnalysisReport {
+            current_ledger: latest_ledger,
+            touched_entries: all_reports,
+            extend_ttl_suggestions,
+        })
     }
 
     fn build_extend_ttl_suggestions(
@@ -3072,214 +3207,7 @@ pub fn profile_contract_with_flamegraph(
 const CACHE_TTL_SECS: u64 = 3_600;
 const CACHE_MAX_CAPACITY: u64 = 1_000;
 
-/// In-memory simulation result cache backed by `moka`.
-///
-/// Cache key: `hex(sha256(contract_id ‖ function_name ‖ args_as_json))`
-/// TTL: 1 hour — balances freshness vs. RPC cost reduction.
-pub struct SimulationCache {
-    inner: Cache<String, SimulationResult>,
-    hits: AtomicU64,
-    misses: AtomicU64,
-    /// Hits served from the disk-backed L2 tier (and promoted into L1).
-    /// Tracked separately so operators can tell an L1 hit apart from an
-    /// L2 hit in the emitted stats line.
-    l2_hits: AtomicU64,
-    /// Optional disk-backed L2 store. When `None`, the cache behaves
-    /// exactly as the L1-only MVP did.
-    l2: Option<Arc<crate::cache::DiskCache>>,
-    /// Caller-provided view of the current Soroban ledger, used to stamp
-    /// L2 writes and drive staleness checks on L2 reads. Defaults to `0`,
-    /// which disables age-based eviction until the caller wires in a
-    /// ledger watcher via [`set_current_ledger`](Self::set_current_ledger).
-    current_ledger: std::sync::atomic::AtomicU32,
-}
-
-impl SimulationCache {
-    pub fn new() -> Arc<Self> {
-        let inner = Cache::builder()
-            .max_capacity(CACHE_MAX_CAPACITY)
-            .time_to_live(Duration::from_secs(CACHE_TTL_SECS))
-            .build();
-        Arc::new(Self {
-            inner,
-            hits: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
-            l2_hits: AtomicU64::new(0),
-            l2: None,
-            current_ledger: std::sync::atomic::AtomicU32::new(0),
-        })
-    }
-
-    /// Return a new cache wrapping the same L1 state plus a disk-backed
-    /// L2 tier. Intended for construction at service start:
-    ///
-    /// ```ignore
-    /// let cache = SimulationCache::new().with_disk_cache(Arc::new(disk));
-    /// ```
-    ///
-    /// Takes `Arc<Self>` so the caller keeps the existing single-owner
-    /// invariant without juggling interior mutability on the cache
-    /// fields.
-    pub fn with_disk_cache(self: Arc<Self>, l2: Arc<crate::cache::DiskCache>) -> Arc<Self> {
-        // Unwrap, mutate, rewrap. `Arc::try_unwrap` only succeeds when the
-        // caller holds the only strong reference; that's fine at service
-        // start, which is the documented call site. A future caller that
-        // clones the Arc before attaching L2 panics loudly rather than
-        // silently dropping the L2 tier into a shadow copy.
-        let mut owned = Arc::try_unwrap(self).unwrap_or_else(|shared| {
-            panic!(
-                "SimulationCache::with_disk_cache called with {} live Arc clones; \
-                 attach the L2 tier before cloning the cache",
-                Arc::strong_count(&shared)
-            )
-        });
-        owned.l2 = Some(l2);
-        Arc::new(owned)
-    }
-
-    /// Update the cache's view of the current ledger. The ledger watcher
-    /// is expected to call this on every new ledger so L2 reads can
-    /// correctly reject entries older than `max_ledger_age` ledgers.
-    pub fn set_current_ledger(&self, ledger: u32) {
-        self.current_ledger
-            .store(ledger, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// Read the current ledger the cache is using for L2 staleness
-    /// checks. Primarily useful for tests and `/health` diagnostics.
-    pub fn current_ledger(&self) -> u32 {
-        self.current_ledger
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Trigger a bulk sweep on the L2 store. No-op when no disk cache is
-    /// attached.
-    pub fn evict_stale_l2(&self) -> u64 {
-        match &self.l2 {
-            Some(l2) => l2.evict_stale(self.current_ledger()),
-            None => 0,
-        }
-    }
-
-    pub fn generate_key(contract_id: &str, function_name: &str, args: &[String]) -> String {
-        let args_json = serde_json::to_string(args).unwrap_or_else(|_| "[]".to_string());
-        let input = format!("{}{}{}", contract_id, function_name, args_json);
-        let digest = Sha256::digest(input.as_bytes());
-        hex::encode(digest)
-    }
-
-    pub async fn get(&self, key: &str) -> Option<SimulationResult> {
-        // L1 — Moka.
-        if let Some(value) = self.inner.get(key).await {
-            self.hits.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(cache.key = %key, "Cache HIT (L1)");
-            return Some(value);
-        }
-
-        // L2 — disk. Any I/O or decode error falls through as a miss;
-        // the disk store logs the underlying reason itself.
-        //
-        // We serialise `SimulationResult` with serde_json rather than
-        // bincode because the struct carries `#[serde(skip_serializing_if)]`
-        // attributes. bincode writes positionally, so a skipped field on
-        // write would desynchronise the deserialiser on read; JSON is
-        // self-describing and handles the skip cleanly. The disk store
-        // itself still uses bincode for its own fixed-shape wrapper.
-        if let Some(l2) = &self.l2 {
-            let current_ledger = self.current_ledger();
-            if let Some(raw) = l2.get(key.as_bytes(), current_ledger) {
-                if let Ok(value) = serde_json::from_slice::<SimulationResult>(&raw) {
-                    self.l2_hits.fetch_add(1, Ordering::Relaxed);
-                    // Promote into L1 so subsequent reads skip the decode.
-                    self.inner.insert(key.to_string(), value.clone()).await;
-                    tracing::debug!(cache.key = %key, "Cache HIT (L2, promoted to L1)");
-                    return Some(value);
-                } else {
-                    tracing::warn!(
-                        cache.key = %key,
-                        "L2 payload failed to deserialise; treating as miss"
-                    );
-                }
-            }
-        }
-
-        self.misses.fetch_add(1, Ordering::Relaxed);
-        tracing::debug!(cache.key = %key, "Cache MISS");
-        None
-    }
-
-    pub async fn set(&self, key: String, value: SimulationResult) {
-        // Write L2 first so a crash between L1 and L2 leaves the durable
-        // tier consistent; if L2 errors, L1 still gets populated so the
-        // request path isn't penalised.
-        if let Some(l2) = &self.l2 {
-            match serde_json::to_vec(&value) {
-                Ok(raw) => {
-                    // Use the simulation's own `latest_ledger` when
-                    // available — it's the ledger the payload is actually
-                    // valid against. Fall back to the cache's current
-                    // ledger view if the simulation didn't populate one.
-                    let written_at = if value.latest_ledger == 0 {
-                        self.current_ledger()
-                    } else {
-                        value.latest_ledger as u32
-                    };
-                    if let Err(e) = l2.set(key.as_bytes(), raw, written_at) {
-                        tracing::warn!(
-                            error = %e,
-                            cache.key = %key,
-                            "L2 write failed; L1 will still serve"
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        cache.key = %key,
-                        "L2 payload serialisation failed; L1 will still serve"
-                    );
-                }
-            }
-        }
-        self.inner.insert(key, value).await;
-    }
-
-    pub fn log_stats(&self) {
-        let l1_hits = self.hits.load(Ordering::Relaxed);
-        let l2_hits = self.l2_hits.load(Ordering::Relaxed);
-        let hits = l1_hits + l2_hits;
-        let misses = self.misses.load(Ordering::Relaxed);
-        let total = hits + misses;
-        let hit_rate_pct = hits
-            .checked_mul(100)
-            .and_then(|value| value.checked_div(total))
-            .unwrap_or(0);
-        tracing::info!(
-            cache.l1_hits = l1_hits,
-            cache.l2_hits = l2_hits,
-            cache.hits = hits,
-            cache.misses = misses,
-            cache.total = total,
-            cache.hit_rate_pct = hit_rate_pct,
-            "Cache statistics"
-        );
-    }
-}
-
-// ── Test-only helpers on SimulationCache ──────────────────────────────────────
-// Placed in a dedicated #[cfg(test)] impl block — the idiomatic Rust pattern
-// that ensures Arc<SimulationCache> deref resolves these methods correctly
-// during test compilation without polluting the public API.
-
-#[cfg(test)]
-impl SimulationCache {
-    fn hit_count(&self) -> u64 {
-        self.hits.load(Ordering::Relaxed)
-    }
-    fn miss_count(&self) -> u64 {
-        self.misses.load(Ordering::Relaxed)
-    }
-}
+// SimulationCache has been moved to cache.rs
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 

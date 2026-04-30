@@ -11,10 +11,12 @@ mod jobs;
 mod parser;
 mod routing;
 pub mod rpc_provider;
+mod cache;
 mod simulation;
 mod wasm_branch_analysis;
 mod ws;
 
+use crate::cache::{SimulationCache, ContractCache};
 use crate::comparison::{CompareMode, RegressionFlag, RegressionReport, ResourceDelta};
 use crate::errors::AppError;
 use axum::{
@@ -49,8 +51,8 @@ use crate::insights::InsightsEngine;
 use crate::jobs::{
     JobId, JobQueue, JobQueueConfig, JobWorker, SubmitJobRequest, SubmitJobResponse,
 };
-use crate::rpc_provider::{ProviderRegistry, RegistryConfig, RegistrySnapshot, RpcProvider};
-use crate::simulation::{SimulationCache, SimulationEngine, SimulationResult};
+use crate::rpc_provider::{ProviderRegistry, RpcProvider};
+use crate::simulation::{SimulationEngine, SimulationResult};
 use axum::{
     extract::{Json, Multipart, Path, State},
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
@@ -1889,50 +1891,17 @@ async fn main() {
         tracing::info!("Fee market analysis is disabled");
     }
 
-    // Attach the disk-backed L2 cache when an operator-configured path
-    // is set. An empty path keeps the L1-only behaviour; a failure to
-    // open the directory is non-fatal — we log and continue without the
-    // L2 tier rather than preventing the service from starting.
-    let cache = {
-        let base = SimulationCache::new();
-        if config.disk_cache_path.is_empty() {
-            tracing::info!("Disk cache disabled (DISK_CACHE_PATH not set)");
-            base
-        } else {
-            let cfg = DiskCacheConfig::new(
-                std::path::PathBuf::from(&config.disk_cache_path),
-                config.max_ledger_age,
-            );
-            match DiskCache::open(cfg) {
-                Ok(disk) => {
-                    tracing::info!(
-                        path = %config.disk_cache_path,
-                        max_ledger_age = config.max_ledger_age,
-                        entries = disk.len(),
-                        "Disk cache attached as L2 tier"
-                    );
-                    base.with_disk_cache(Arc::new(disk))
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        path = %config.disk_cache_path,
-                        error = %e,
-                        "Failed to open disk cache; continuing with L1 only"
-                    );
-                    base
-                }
-            }
-        }
-    };
+    // ── Persistent Cache Setup (L2) ─────────────────────────────────────
+    let sled_db = sled::open("soroscope_cache").expect("Failed to open sled database");
+    let simulation_cache = SimulationCache::new(&sled_db);
+    let contract_cache = Arc::new(ContractCache::new(&sled_db));
 
     let app_state = Arc::new(AppState {
-        engine: SimulationEngine::with_registry_and_timeout_and_mode(
+        engine: SimulationEngine::with_registry_and_cache(
             Arc::clone(&registry),
-            simulation_timeout,
-            simulation_mode,
+            Arc::clone(&contract_cache),
         ),
-        provider_registry: Arc::clone(&registry),
-        cache: SimulationCache::new(),
+        cache: simulation_cache,
         insights_engine: InsightsEngine::new(),
         gas_golfing_analyzer: GasGolfingAnalyzer::new(),
         simulation_timeout,
