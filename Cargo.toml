@@ -12,8 +12,5 @@ members = [
     "contracts/factory",
     "contracts/math",
     "contracts/typed_data_auth",
-    "contracts/governance",
-    "contracts/cdp",
-    "contracts/batch_transfer",
-    "contracts/private_transfer",
+    "contracts/proxy",
 ]
