@@ -51,13 +51,15 @@ use crate::jobs::{
 use crate::rpc_provider::{ProviderRegistry, RegistryConfig, RegistrySnapshot, RpcProvider};
 use crate::simulation::{SimulationCache, SimulationEngine, SimulationResult};
 use axum::{
-    extract::{Json, Multipart, State},
-    http::{HeaderMap, HeaderName, HeaderValue},
+    extract::{Json, Multipart, Path, State},
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
     middleware,
+    response::IntoResponse,
     routing::{get, post},
     Extension, Router,
 };
 use config::{Config, ConfigError};
+use prometheus::{Encoder, HistogramVec, IntCounterVec, Opts, Registry, TextEncoder};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
@@ -318,8 +320,65 @@ pub struct AppState {
     fee_analytics_engine: FeeAnalyticsEngine,
     /// Fee data store
     fee_store: Arc<FeeStore>,
-    /// Real-time event bus for WebSocket streaming (Issue #105).
-    pub simulation_bus: Arc<SimulationBus>,
+    /// Prometheus metrics collectors.
+    metrics: Arc<AppMetrics>,
+}
+
+#[derive(Clone)]
+struct AppMetrics {
+    registry: Registry,
+    simulation_latency_seconds: HistogramVec,
+    rpc_error_count_total: IntCounterVec,
+    simulation_requests_total: IntCounterVec,
+    resource_utilization_percent: prometheus::GaugeVec,
+}
+
+impl AppMetrics {
+    fn new() -> Result<Self, prometheus::Error> {
+        let registry = Registry::new();
+
+        let simulation_latency_seconds = HistogramVec::new(
+            prometheus::HistogramOpts::new(
+                "simulation_latency_seconds",
+                "Latency of simulation requests in seconds",
+            ),
+            &["endpoint"],
+        )?;
+        let rpc_error_count_total = IntCounterVec::new(
+            Opts::new(
+                "rpc_error_count_total",
+                "Total number of RPC and simulation errors",
+            ),
+            &["endpoint", "error_type"],
+        )?;
+        let simulation_requests_total = IntCounterVec::new(
+            Opts::new(
+                "simulation_requests_total",
+                "Total number of simulation requests by endpoint and cache status",
+            ),
+            &["endpoint", "cache_status"],
+        )?;
+        let resource_utilization_percent = prometheus::GaugeVec::new(
+            Opts::new(
+                "resource_utilization_percent",
+                "Resource utilization percentage from latest simulation sample",
+            ),
+            &["resource"],
+        )?;
+
+        registry.register(Box::new(simulation_latency_seconds.clone()))?;
+        registry.register(Box::new(rpc_error_count_total.clone()))?;
+        registry.register(Box::new(simulation_requests_total.clone()))?;
+        registry.register(Box::new(resource_utilization_percent.clone()))?;
+
+        Ok(Self {
+            registry,
+            simulation_latency_seconds,
+            rpc_error_count_total,
+            simulation_requests_total,
+            resource_utilization_percent,
+        })
+    }
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -651,6 +710,11 @@ async fn analyze(
             )
             .await
             .map_err(|_| {
+                state
+                    .metrics
+                    .rpc_error_count_total
+                    .with_label_values(&["/analyze", "timeout"])
+                    .inc();
                 tracing::error!("Simulation timed out after {:?}", state.simulation_timeout);
                 AppError::Internal(format!(
                     "Simulation timed out after {} seconds",
@@ -658,12 +722,32 @@ async fn analyze(
                 ))
             })?;
 
-            let sim: SimulationResult = sim_result?;
+            let sim: SimulationResult = match sim_result {
+                Ok(sim) => sim,
+                Err(err) => {
+                    state
+                        .metrics
+                        .rpc_error_count_total
+                        .with_label_values(&["/analyze", "simulation_error"])
+                        .inc();
+                    return Err(err.into());
+                }
+            };
             state.cache.set(cache_key, sim.clone()).await;
             (sim, "MISS")
         };
 
     let latency_ms = start_time.elapsed().as_millis() as u64;
+    state
+        .metrics
+        .simulation_latency_seconds
+        .with_label_values(&["/analyze"])
+        .observe(start_time.elapsed().as_secs_f64());
+    state
+        .metrics
+        .simulation_requests_total
+        .with_label_values(&["/analyze", cache_status])
+        .inc();
 
     // Log comprehensive simulation metrics
     tracing::info!(
@@ -680,6 +764,12 @@ async fn analyze(
     );
 
     state.cache.log_stats();
+    let insights_report = state.insights_engine.analyze(&result.resources);
+    state
+        .metrics
+        .resource_utilization_percent
+        .with_label_values(&["efficiency_score"])
+        .set(insights_report.efficiency_score as f64);
 
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -728,12 +818,37 @@ async fn analyze_wasm(
     let function_name = payload.function_name.clone();
     let args = payload.args.clone().unwrap_or_default();
 
+    let start_time = std::time::Instant::now();
     let resources = tokio::task::spawn_blocking(move || {
         simulation::profile_contract(wasm_bytes, function_name, args, payload.protocol_version, payload.enable_experimental)
     })
     .await
-    .map_err(|e| AppError::Internal(format!("Contract profiling task panicked: {}", e)))?
-    .map_err(|e| AppError::Internal(format!("Contract profiling failed: {}", e)))?;
+    .map_err(|e| {
+        state
+            .metrics
+            .rpc_error_count_total
+            .with_label_values(&["/analyze/wasm", "panic"])
+            .inc();
+        AppError::Internal(format!("Contract profiling task panicked: {}", e))
+    })?
+    .map_err(|e| {
+        state
+            .metrics
+            .rpc_error_count_total
+            .with_label_values(&["/analyze/wasm", "wasm_profile_error"])
+            .inc();
+        AppError::Internal(format!("Contract profiling failed: {}", e))
+    })?;
+    state
+        .metrics
+        .simulation_latency_seconds
+        .with_label_values(&["/analyze/wasm"])
+        .observe(start_time.elapsed().as_secs_f64());
+    state
+        .metrics
+        .simulation_requests_total
+        .with_label_values(&["/analyze/wasm", "LOCAL"])
+        .inc();
 
     let sim_result = simulation::SimulationResult {
         resources,
@@ -746,7 +861,32 @@ async fn analyze_wasm(
         protocol_version: payload.protocol_version.unwrap_or(20),
     };
 
-    Ok(Json(to_report(&sim_result, &state.insights_engine)))
+    let report = to_report(&sim_result, &state.insights_engine);
+    state
+        .metrics
+        .resource_utilization_percent
+        .with_label_values(&["efficiency_score"])
+        .set(report.nutrition.efficiency_score as f64);
+
+    Ok(Json(report))
+}
+
+async fn metrics_handler(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, AppError> {
+    let metric_families = state.metrics.registry.gather();
+    let encoder = TextEncoder::new();
+    let mut buffer = Vec::new();
+    encoder
+        .encode(&metric_families, &mut buffer)
+        .map_err(|e| AppError::Internal(format!("Failed to encode Prometheus metrics: {}", e)))?;
+    let output = String::from_utf8(buffer)
+        .map_err(|e| AppError::Internal(format!("Metrics output encoding error: {}", e)))?;
+    Ok((
+        StatusCode::OK,
+        [("Content-Type", encoder.format_type().to_string())],
+        output,
+    ))
 }
 
 #[utoipa::path(
@@ -1618,7 +1758,7 @@ async fn main() {
         job_queue,
         fee_analytics_engine,
         fee_store,
-        simulation_bus,
+        metrics: Arc::new(AppMetrics::new().expect("Failed to initialize Prometheus metrics")),
     });
 
     let cors = CorsLayer::new().allow_origin(Any);
@@ -1640,9 +1780,7 @@ async fn main() {
             }),
         )
         .route("/health", get(health_check))
-        .route("/registry/providers", get(registry_providers))
-        .route("/registry/peers", get(registry_peers))
-        .route("/registry/gossip", post(registry_gossip))
+        .route("/metrics", get(metrics_handler))
         .route("/auth/challenge", post(auth::challenge_handler))
         .route("/auth/verify", post(auth::verify_handler))
         // Fee market routes (public access)
