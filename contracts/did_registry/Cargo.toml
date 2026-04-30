@@ -1,7 +1,9 @@
 [package]
-name = "soroban-typed-data-auth-contract"
+name = "soroban-did-registry-contract"
+description = "Soroban DID Registry Contract"
 version = "0.0.0"
 edition = "2021"
+publish = false
 
 [lib]
 crate-type = ["cdylib"]
