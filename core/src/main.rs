@@ -185,7 +185,7 @@ fn build_providers(config: &AppConfig) -> Vec<RpcProvider> {
 }
 
 /// Shared application state injected into every Axum handler via [`State`].
-struct AppState {
+pub struct AppState {
     engine: SimulationEngine,
     cache: Arc<SimulationCache>,
     insights_engine: InsightsEngine,
@@ -961,6 +961,7 @@ async fn fee_analytics(
     paths(
         analyze, analyze_wasm, optimize_limits, compare_handler,
         auth::challenge_handler, auth::verify_handler,
+        jobs::submit_job_handler, jobs::get_job_handler, jobs::cancel_job_handler,
         fee_recommend, fee_history, fee_analytics
     ),
     components(schemas(
@@ -969,6 +970,8 @@ async fn fee_analytics(
         CompareApiResponse, RegressionReport, ResourceDelta, RegressionFlag,
         auth::ChallengeRequest, auth::ChallengeResponse,
         auth::VerifyRequest, auth::VerifyResponse,
+        jobs::Job, jobs::JobStatus, jobs::JobType, jobs::JobPayload,
+        jobs::JobProgress, jobs::JobResult, jobs::SubmitJobRequest, jobs::SubmitJobResponse,
         crate::simulation::OptimizationBuffer,
         crate::simulation::SorobanResources,
         FeeRecommendationRequest, FeeRecommendationResponse,
@@ -1227,6 +1230,34 @@ async fn main() {
     let fee_store = Arc::new(FeeStore::new(db_pool.clone()));
     let fee_analytics_engine = FeeAnalyticsEngine::new();
 
+    // ── Distributed Job Queue Setup ─────────────────────────────────────
+    let job_config = JobQueueConfig {
+        job_timeout_secs: config.job_timeout_secs,
+        max_concurrent_jobs: config.max_concurrent_jobs,
+        ..Default::default()
+    };
+
+    let job_queue = JobQueue::new(&config.database_url, &config.redis_url, job_config.clone())
+        .await
+        .expect("Failed to initialize JobQueue");
+
+    // Spawn background cleanup task
+    job_queue.spawn_cleanup_task();
+
+    // Spawn worker
+    let worker = JobWorker::new(
+        job_queue.clone(),
+        SimulationEngine::with_registry_and_timeout(Arc::clone(&registry), simulation_timeout),
+        InsightsEngine::new(),
+        job_config,
+    );
+
+    tokio::spawn(async move {
+        worker.run().await;
+    });
+
+    tracing::info!("Job queue and worker started (Redis backend)");
+
     // Start background fee collector if enabled
     if config.fee_analysis_enabled {
         let collector_config = FeeCollectorConfig {
@@ -1274,6 +1305,7 @@ async fn main() {
         cache: SimulationCache::new(),
         insights_engine: InsightsEngine::new(),
         simulation_timeout,
+        job_queue,
         fee_analytics_engine,
         fee_store,
     });
@@ -1302,6 +1334,10 @@ async fn main() {
         .route("/fees/recommend", get(fee_recommend))
         .route("/fees/history", get(fee_history))
         .route("/fees/analytics", get(fee_analytics))
+        // Job management routes
+        .route("/jobs/submit", post(jobs::submit_job_handler))
+        .route("/jobs/:id", get(jobs::get_job_handler))
+        .route("/jobs/:id/cancel", post(jobs::cancel_job_handler))
         .merge(protected)
         .layer(Extension(auth_state))
         .layer(cors)
