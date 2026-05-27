@@ -9,6 +9,7 @@ import { ContractInteraction } from '../components/ContractInteraction';
 import { MOCK_CONTRACT_FUNCTIONS, generateMockResult, generateMockResourceCost } from '../lib/sorobantypes';
 import type { ContractFunction, InvocationResult } from '../lib/sorobantypes';
 import { UploadZone } from '../components/upload-zone';
+import { extractErrorDetails, createUserFriendlyMessage } from '../lib/errorHandling';
 
 export default function Home() {
   const [contractId, setContractId] = useState('CAEZJVJ4N7P7GRUVD5NG5LYYH23AQHJUKQEUHW54LR5PGQX3V7FXD7Q');
@@ -31,7 +32,10 @@ export default function Home() {
       });
 
       if (!response.ok) {
-        throw new Error(`Backend error: ${response.statusText}`);
+        // Parse error response from backend
+        const errorResponse = await extractErrorDetails(response);
+        const userMessage = createUserFriendlyMessage(errorResponse);
+        throw new Error(userMessage);
       }
 
       const report = await response.json();
@@ -49,11 +53,13 @@ export default function Home() {
       setCurrentResult(result);
       addToHistory(result);
     } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'An unexpected error occurred during analysis';
+      
       const errorResult: InvocationResult = {
         id: Math.random().toString(36).substring(7),
         functionName: selectedFunction.name,
         inputs,
-        error: error instanceof Error ? error.message : 'Unknown error',
+        error: errorMessage,
         timestamp: Date.now(),
         success: false,
       };
