@@ -9,6 +9,7 @@ import { ContractInteraction } from '../components/ContractInteraction';
 import { MOCK_CONTRACT_FUNCTIONS, generateMockResult, generateMockResourceCost } from '../lib/sorobantypes';
 import type { ContractFunction, InvocationResult } from '../lib/sorobantypes';
 import { UploadZone } from '../components/upload-zone';
+import { extractErrorDetails, createUserFriendlyMessage } from '../lib/errorHandling';
 import { ErrorBoundary } from '../components/ErrorBoundary';
 
 export default function Home() {
@@ -21,6 +22,7 @@ export default function Home() {
 
   const handleSimulate = async (inputs: Record<string, any>) => {
     setLoading(true);
+    let errorType: string | undefined;
     try {
       const response = await fetch('http://localhost:8080/analyze', {
         method: 'POST',
@@ -32,7 +34,11 @@ export default function Home() {
       });
 
       if (!response.ok) {
-        throw new Error(`Backend error: ${response.statusText}`);
+        // Parse error response from backend
+        const errorResponse = await extractErrorDetails(response);
+        errorType = errorResponse.error;
+        const userMessage = createUserFriendlyMessage(errorResponse);
+        throw new Error(userMessage);
       }
 
       const report = await response.json();
@@ -50,11 +56,14 @@ export default function Home() {
       setCurrentResult(result);
       addToHistory(result);
     } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'An unexpected error occurred during analysis';
+      
       const errorResult: InvocationResult = {
         id: Math.random().toString(36).substring(7),
         functionName: selectedFunction.name,
         inputs,
-        error: error instanceof Error ? error.message : 'Unknown error',
+        error: errorMessage,
+        errorType: errorType || 'UNKNOWN_ERROR',
         timestamp: Date.now(),
         success: false,
       };
